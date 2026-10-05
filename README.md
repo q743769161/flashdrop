@@ -32,6 +32,17 @@
 
 以后想换密码、改保留天数，直接在 Variables 里改，不用动代码。
 
+## 用量面板
+
+页面底部有一块「用量」：**R2 存储**（已用 / 10GB、文件数）开箱即用，无需配置。
+
+**今日 Workers 请求数**需要两个额外变量才会显示：
+
+1. Cloudflare 后台 → 右上角头像 → My Profile → API Tokens → Create Token → Create Custom Token
+2. 权限选 Account → Account Analytics → Read；Account Resources 选你的账号 → Continue to summary → Create Token，复制 token
+3. 回到 flashdrop Worker → Settings → Variables：添加 Secret `CF_API_TOKEN`（粘贴 token，点 Encrypt），再添加普通变量 `CF_ACCOUNT_ID`（Account ID 在 Workers & Pages 总览页右侧可以找到）
+4. Redeploy。之后用量面板会多一行「今日 Workers 请求 X / 100,000」（免费版每日限额）
+
 ## 本地开发（可选）
 
 ```bash

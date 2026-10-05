@@ -258,6 +258,74 @@ async function cleanup(env) {
   return { texts: texts.length, files: kept.length };
 }
 
+
+// Cloudflare 账号用量（GraphQL），5 分钟内存缓存；未配置则返回 configured:false
+let _wuCache = { ts: 0, data: null };
+async function getWorkersUsage(env) {
+  const now = Date.now();
+  if (_wuCache.data && now - _wuCache.ts < 300000) return _wuCache.data;
+  const out = { configured: false };
+  if (env.CF_API_TOKEN && env.CF_ACCOUNT_ID) {
+    try {
+      const day = new Date().toISOString().slice(0, 10); // UTC 日期
+      const query =
+        "query($tag:String!,$d:String!){viewer{accounts(filter:{accountTag:$tag})" +
+        "{workersInvocationsAdaptive(filter:{date_geq:$d,date_leq:$d},limit:10000)" +
+        "{dimensions{date}sum{requests}}}}}";
+      const resp = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer " + env.CF_API_TOKEN,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ query: query, variables: { tag: env.CF_ACCOUNT_ID, d: day } }),
+      });
+      const data = await resp.json();
+      const accounts = (((data || {}).data || {}).viewer || {}).accounts || [];
+      let total = 0;
+      if (accounts[0] && accounts[0].workersInvocationsAdaptive) {
+        for (const r of accounts[0].workersInvocationsAdaptive) {
+          total += (r.sum && r.sum.requests) || 0;
+        }
+      }
+      out.configured = true;
+      out.requestsToday = total;
+      out.limit = 100000;
+      out.day = day;
+    } catch (e) {
+      out.configured = true;
+      out.error = true;
+    }
+  }
+  _wuCache = { ts: now, data: out };
+  return out;
+}
+
+async function handleStats(request, env) {
+  let bytes = 0, objects = 0;
+  try {
+    let cursor = undefined;
+    do {
+      const page = await env.BUCKET.list({ cursor: cursor });
+      for (const o of page.objects) {
+        bytes += o.size || 0;
+        objects++;
+      }
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+  } catch (e) {}
+  let files = [], texts = [];
+  try { files = await readJson(env.BUCKET, FILES_KEY, []); } catch (e) {}
+  try { texts = await readJson(env.BUCKET, TEXTS_KEY, []); } catch (e) {}
+  const workers = await getWorkersUsage(env);
+  return json({
+    r2: { bytes: bytes, objects: objects, limitBytes: 10737418240 },
+    files: files.length,
+    texts: texts.length,
+    workers: workers,
+  });
+}
+
 // ---------------- 前端页面（单文件，内嵌在 Worker 里，无需构建） ----------------
 const PAGE = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -319,6 +387,13 @@ header button{background:rgba(255,255,255,.55);-webkit-backdrop-filter:blur(14px
 #upFill{height:100%;width:0;background:linear-gradient(90deg,#3b9bff,#007aff);border-radius:5px;transition:width .15s;box-shadow:0 0 8px rgba(0,122,255,.5)}
 #upText{font-size:13px;color:#636366;margin-top:8px;min-height:18px}
 .fname{font-size:16px;font-weight:600;word-break:break-all;margin-bottom:4px;position:relative;z-index:1}
+#statsCard{margin-top:22px}
+.stat-row{display:flex;justify-content:space-between;font-size:14px;margin:12px 0 6px;position:relative;z-index:1;color:#3a3a3c}
+.stat-row span:last-child{font-weight:600;color:#1c1c1e}
+.pbar{height:8px;background:rgba(255,255,255,.5);border-radius:5px;overflow:hidden;box-shadow:inset 0 1px 3px rgba(0,0,0,.08);position:relative;z-index:1}
+.pbar>div{height:100%;width:0;background:linear-gradient(90deg,#3b9bff,#007aff);border-radius:5px;transition:width .4s}
+.hint{font-size:12px;color:#636366;margin-top:10px;line-height:1.7;position:relative;z-index:1}
+.hint b{color:#1c1c1e}
 </style>
 </head>
 <body>
@@ -355,6 +430,14 @@ header button{background:rgba(255,255,255,.55);-webkit-backdrop-filter:blur(14px
     <div id="upText"></div>
     <div id="fileList"></div>
   </section>
+  <div class="card" id="statsCard">
+    <div class="meta">用量</div>
+    <div class="stat-row"><span>R2 存储</span><span id="statR2">加载中…</span></div>
+    <div class="pbar"><div id="statR2Bar"></div></div>
+    <div class="stat-row"><span>今日 Workers 请求</span><span id="statW">加载中…</span></div>
+    <div class="pbar"><div id="statWBar"></div></div>
+    <div id="statHint" class="hint hidden">在 Cloudflare 后台给 Worker 添加 <b>CF_API_TOKEN</b>（API 令牌，需 Account Analytics 读取权限）与 <b>CF_ACCOUNT_ID</b> 两个变量后，这里会显示今日请求用量</div>
+  </div>
 </div>
 <script>
 var $ = function(id){ return document.getElementById(id); };
@@ -373,7 +456,7 @@ function api(path, opt){
 }
 /* ---- 登录 ---- */
 function showLogin(){ $("login").classList.remove("hidden"); $("app").classList.add("hidden"); }
-function showApp(){ $("login").classList.add("hidden"); $("app").classList.remove("hidden"); refreshTexts(); refreshFiles(); }
+function showApp(){ $("login").classList.add("hidden"); $("app").classList.remove("hidden"); refreshTexts(); refreshFiles(); refreshStats(); }
 function doLogin(){
   var pw = $("pw").value;
   $("loginErr").textContent = "";
@@ -425,6 +508,27 @@ function copyText(id, btn){
   if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(t).then(done).catch(function(){ fallback(); }); }
   else fallback();
   function fallback(){ var ta = document.createElement("textarea"); ta.value = t; document.body.appendChild(ta); ta.select(); try{ document.execCommand("copy"); }catch(e){} document.body.removeChild(ta); done(); }
+}
+/* ---- 用量 ---- */
+function refreshStats(){
+  api("/api/stats").then(function(r){
+    var d = r.data;
+    var rb = d.r2.bytes, rl = d.r2.limitBytes;
+    $("statR2").textContent = fmtSize(rb) + " / " + fmtSize(rl) + " · " + d.files + " 个文件";
+    $("statR2Bar").style.width = Math.max(2, Math.min(100, rb / rl * 100)).toFixed(1) + "%";
+    var w = d.workers;
+    if(!w.configured){
+      $("statW").textContent = "未配置";
+      $("statWBar").style.width = "0";
+      $("statHint").classList.remove("hidden");
+    } else if(w.error){
+      $("statW").textContent = "获取失败";
+      $("statWBar").style.width = "0";
+    } else {
+      $("statW").textContent = w.requestsToday.toLocaleString("en-US") + " / " + w.limit.toLocaleString("en-US");
+      $("statWBar").style.width = Math.max(2, Math.min(100, w.requestsToday / w.limit * 100)).toFixed(1) + "%";
+    }
+  }).catch(function(){});
 }
 /* ---- 文件 ---- */
 $("dropzone").onclick = function(){ $("fileInput").click(); };
@@ -519,6 +623,7 @@ export default {
     // 以下接口都需要登录
     if (!(await isAuthed(request, env))) return json({ ok: false, error: "未登录" }, 401);
 
+    if (path === "/api/stats" && request.method === "GET") return handleStats(request, env, url);
     if (path === "/api/texts" || path.startsWith("/api/texts/")) return handleTexts(request, env, url);
     if (path === "/api/files" || path.startsWith("/api/files/")) return handleFiles(request, env, url);
 
