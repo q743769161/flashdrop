@@ -1,0 +1,17 @@
+name = "flashdrop"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+# R2 存储桶绑定：变量名 BUCKET，对应 Cloudflare 后台创建的 bucket "flashdrop-files"
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "flashdrop-files"
+
+# 每天凌晨 3 点（北京时间）清理过期内容
+[triggers]
+crons = ["0 19 * * *"]
+
+# 可选变量（Cloudflare 后台 Variables 里可覆盖）
+[vars]
+FILE_TTL_DAYS = "7"
+TEXT_TTL_DAYS = "30"
